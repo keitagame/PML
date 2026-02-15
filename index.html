@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>MML Editor Complete</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{
+  background:#000;
+  color:#fff;
+  font-family:sans-serif;
+  margin:20px;
+}
+textarea{
+  width:100%;
+  height:200px;
+  background:#000;
+  color:#0f0;
+}
+button,select,input{
+  background:#111;
+  color:#fff;
+  margin:4px;
+}
+</style>
+</head>
+<body>
+
+<h1>MML Editor</h1>
+
+MIDI:
+<select id="midi"></select>
+
+Tempo:
+<input id="tempo" value="120" size="4">
+
+<button id="play">Play</button>
+<button id="stop">Stop</button>
+<button id="export">MIDI Export</button>
+
+<textarea id="mml">
+A t120 o4 l4 c d e f g a b > c
+B @40 o3 l8 c r c r g r g r
+</textarea>
+
+<script>
+let midiOut=null;
+let midiAccess=null;
+let playing=false;
+let timers=[];
+
+navigator.requestMIDIAccess().then(m=>{
+  midiAccess=m;
+  let sel=document.getElementById("midi");
+  for(let o of m.outputs.values()){
+    let op=document.createElement("option");
+    op.text=o.name;
+    op.value=o.id;
+    sel.appendChild(op);
+  }
+  sel.onchange=()=> midiOut=m.outputs.get(sel.value);
+  if(sel.options.length>0){
+    midiOut=m.outputs.get(sel.options[0].value);
+  }
+});
+
+function noteToMidi(n,oct){
+  const table={c:0,d:2,e:4,f:5,g:7,a:9,b:11};
+  return 12*(oct+1)+table[n];
+}
+
+function parseTrack(text){
+  let tempo=120;
+  let octave=4;
+  let length=4;
+  let prog=0;
+  let time=0;
+  let events=[];
+  text=text.toLowerCase();
+
+  for(let i=0;i<text.length;i++){
+    let c=text[i];
+
+    if(c==="t"){
+      let v="";
+      while(/\d/.test(text[++i])) v+=text[i];
+      tempo=parseInt(v);
+      i--;
+    }
+    if(c==="o"){
+      let v="";
+      while(/\d/.test(text[++i])) v+=text[i];
+      octave=parseInt(v);
+      i--;
+    }
+    if(c==="l"){
+      let v="";
+      while(/\d/.test(text[++i])) v+=text[i];
+      length=parseInt(v);
+      i--;
+    }
+    if(c===">") octave++;
+    if(c==="<") octave--;
+
+    if(c==="@"){
+      let v="";
+      while(/\d/.test(text[++i])) v+=text[i];
+      prog=parseInt(v);
+      events.push({type:"prog",time,prog});
+      i--;
+    }
+
+    if("cdefgab".includes(c)){
+      let n=c;
+      let l=length;
+      let dur=60000/tempo*(4/l);
+      events.push({
+        type:"note",
+        time,
+        note:noteToMidi(n,octave),
+        dur
+      });
+      time+=dur;
+    }
+
+    if(c==="r"){
+      let dur=60000/tempo*(4/length);
+      time+=dur;
+    }
+  }
+  return events;
+}
+
+function parseMML(mml){
+  let lines=mml.split("\n");
+  let tracks=[];
+  for(let l of lines){
+    if(!l.trim()) continue;
+    tracks.push(parseTrack(l));
+  }
+  return tracks;
+}
+
+function play(){
+  stop();
+  if(!midiOut) return;
+
+  let tracks=parseMML(document.getElementById("mml").value);
+
+  tracks.forEach((tr,ch)=>{
+    tr.forEach(ev=>{
+      if(ev.type==="prog"){
+        timers.push(setTimeout(()=>{
+          midiOut.send([0xC0+ch,ev.prog]);
+        },ev.time));
+      }
+      if(ev.type==="note"){
+        timers.push(setTimeout(()=>{
+          midiOut.send([0x90+ch,ev.note,100]);
+        },ev.time));
+        timers.push(setTimeout(()=>{
+          midiOut.send([0x80+ch,ev.note,0]);
+        },ev.time+ev.dur));
+      }
+    });
+  });
+}
+
+function stop(){
+  timers.forEach(t=>clearTimeout(t));
+  timers=[];
+}
+
+document.getElementById("play").onclick=play;
+document.getElementById("stop").onclick=stop;
+
+function exportMidi(){
+  let tracks=parseMML(document.getElementById("mml").value);
+
+  let bytes=[];
+  function push(...a){bytes.push(...a);}
+
+  push(0x4d,0x54,0x68,0x64,0,0,0,6,0,1,0,tracks.length,0,96);
+
+  tracks.forEach((tr,ch)=>{
+    let data=[];
+    let last=0;
+
+    function varlen(v){
+      let b=[v&127];
+      while(v>>=7) b.unshift((v&127)|128);
+      return b;
+    }
+
+    tr.forEach(ev=>{
+      let delta=Math.floor(ev.time/10)-last;
+      last+=delta;
+      data.push(...varlen(delta));
+
+      if(ev.type==="prog"){
+        data.push(0xC0+ch,ev.prog);
+      }
+      if(ev.type==="note"){
+        data.push(0x90+ch,ev.note,100);
+        data.push(...varlen(Math.floor(ev.dur/10)));
+        data.push(0x80+ch,ev.note,0);
+      }
+    });
+
+    data.push(0,0xff,0x2f,0);
+
+    push(0x4d,0x54,0x72,0x6b,
+      (data.length>>24)&255,
+      (data.length>>16)&255,
+      (data.length>>8)&255,
+      data.length&255,
+      ...data);
+  });
+
+  let blob=new Blob([new Uint8Array(bytes)],{type:"audio/midi"});
+  let a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="song.mid";
+  a.click();
+}
+
+document.getElementById("export").onclick=exportMidi;
+</script>
+</body>
+</html>
